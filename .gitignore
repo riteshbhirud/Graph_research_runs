@@ -1,0 +1,13 @@
+venv/
+hf_cache/
+models/
+data/
+systems/
+BrowseComp-Plus/
+trajectories/
+logs/
+results/
+checkpoints/
+env.sh
+__pycache__/
+*.pyc

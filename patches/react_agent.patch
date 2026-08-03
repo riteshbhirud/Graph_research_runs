@@ -1,0 +1,147 @@
+diff --git a/inference/react_agent.py b/inference/react_agent.py
+index 0f36c61..27f8808 100644
+--- a/inference/react_agent.py
++++ b/inference/react_agent.py
+@@ -75,6 +75,14 @@ TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
+ if os.environ.get("DISABLE_VISIT_TOOL", "").lower() in ("1", "true", "yes"):
+     TOOL_MAP.pop("visit", None)
+ 
++# --- Offline BrowseComp-Plus evaluation ---
++# Enabled by BCP_OFFLINE=true. Routes visit to the local Lucene index and
++# returns a uniform error for tools outside the offline tool set.
++import bcp_offline
++BCP_OFFLINE = os.environ.get("BCP_OFFLINE", "").strip().lower() in ("1", "true", "yes")
++if BCP_OFFLINE:
++    print(f"[bcp_offline] Offline mode ON. Allowed tools: {sorted(bcp_offline.ALLOWED_TOOLS)}")
++
+ import random
+ 
+ PYTHON_TOOL_PROMPT = """{"type": "function", "function": {"name": "PythonInterpreter", "description": "Executes Python code in a sandboxed environment. To use this tool, you must follow this format:\n1. The 'arguments' JSON object must be empty: {}.\n2. The Python code to be executed must be placed immediately after the JSON block, enclosed within <code> and </code> tags.\n\nIMPORTANT: Any output you want to see MUST be printed to standard output using the print() function.\n\nExample of a correct call:\n<tool_call>\n{\"name\": \"PythonInterpreter\", \"arguments\": {}}\n<code>\nimport numpy as np\n# Your code here\nprint(f\"The result is: {np.mean([1,2,3])}\")\n</code>\n</tool_call>", "parameters": {"type": "object", "properties": {}}}}
+@@ -361,12 +369,28 @@ class MultiTurnReactAgent(FnCallAgent):
+         try:
+             tool_call = json.loads(json_part)
+         except Exception:
+-            raw_tool_name = ["__invalid_tool_call_json__", raw_tool_call]
+-            return (
+-                None,
+-                None,
+-                f"[Tool Error] Invalid tool call format: name must be string, got {raw_tool_name!r}",
+-            )
++            # Offline evaluation: attempt the minimal trailing-brace repair
++            # before failing. Applied identically to every checkpoint and
++            # logged, so the repair rate stays comparable across Base/SFT/RL.
++            repaired = None
++            if BCP_OFFLINE:
++                try:
++                    _tl = self._get_thread_state()
++                    _fn = _tl.current_filename
++                    _turn = getattr(_tl, "current_round", -1)
++                except Exception:
++                    _fn, _turn = "", -1
++                repaired, _k = bcp_offline.repair_tool_call(
++                    json_part, filename=_fn, turn_id=_turn
++                )
++            if repaired is None:
++                raw_tool_name = ["__invalid_tool_call_json__", raw_tool_call]
++                return (
++                    None,
++                    None,
++                    f"[Tool Error] Invalid tool call format: name must be string, got {raw_tool_name!r}",
++                )
++            tool_call = repaired
+ 
+         # Align with training-side parser:
+         # - dict: read {"name", "arguments"}
+@@ -969,6 +993,14 @@ IMPORTANT: This state summary is maintained automatically. You can reference it
+                     timeout=600.0,
+                 )
+                 max_tokens = int(os.getenv('LLM_MAX_TOKENS', '10000'))
++                # Base Qwen3 must run in non-thinking mode: its thinking mode
++                # emits structurally malformed tool calls (0/5 parseable vs
++                # 5/5 non-thinking at greedy). QUEST's own checkpoints ship a
++                # template that forces thinking and were trained for it, so
++                # this is only set for the base model.
++                extra_body = None
++                if os.getenv('QUEST_ENABLE_THINKING', '').strip().lower() in ('0', 'false', 'no', 'off'):
++                    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+                 chat_response = client.chat.completions.create(
+                     model=tl.model,
+                     messages=msgs,
+@@ -977,7 +1009,8 @@ IMPORTANT: This state summary is maintained automatically. You can reference it
+                     top_p=self.llm_generate_cfg.get('top_p', 0.95),
+                     logprobs=True,
+                     max_tokens=max_tokens,
+-                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1)
++                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1),
++                    extra_body=extra_body,
+                 )
+                 content = chat_response.choices[0].message.content
+ 
+@@ -1260,7 +1293,33 @@ IMPORTANT: This state summary is maintained automatically. You can reference it
+             if '<tool_call>' in content and '</tool_call>' in content:
+                 matches = list(re.finditer(r"<tool_call>(.*?)</tool_call>", content, re.DOTALL))
+                 raw_tool_call = matches[-1].group(1).strip()
++                if BCP_OFFLINE:
++                    tl.current_round = round
+                 tool_name, tool_args, tool_error = self._normalize_tool_call(raw_tool_call)
++                if BCP_OFFLINE and len(matches) > 1:
++                    # QUEST executes only the LAST block (matches[-1]); keep that
++                    # behaviour and log what the model lost by emitting several.
++                    bcp_offline.log_multi_block({
++                        "question_id": tl.current_filename,
++                        "turn_id": round,
++                        "checkpoint": bcp_offline.CHECKPOINT,
++                        "total_blocks_detected": len(matches),
++                        "block_index_executed": len(matches) - 1,
++                        "discarded_blocks": [m.group(1).strip() for m in matches[:-1]],
++                        "executed_block": raw_tool_call,
++                        "executed_block_valid": tool_error is None,
++                    })
++                if BCP_OFFLINE:
++                    # One event per tool-call attempt, so attempt/valid counts
++                    # and the repair rate can be derived per checkpoint.
++                    bcp_offline.log_event({
++                        "event": "tool_call_attempt",
++                        "question_id": tl.current_filename,
++                        "turn_id": round,
++                        "checkpoint": bcp_offline.CHECKPOINT,
++                        "parsed_ok": tool_error is None,
++                        "tool": tool_name if tool_error is None else None,
++                    })
+ 
+                 if tool_error is not None:
+                     result = tool_error
+@@ -1485,6 +1544,17 @@ IMPORTANT: This state summary is maintained automatically. You can reference it
+         return attach_resume_metadata(result)
+ 
+     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
++        # --- Offline BrowseComp-Plus evaluation ---
++        # SFT/RL checkpoints were trained with tools that are not part of this
++        # evaluation (google_scholar, PythonInterpreter). Return a uniform
++        # error and log the attempt so the rate is reportable per checkpoint.
++        if BCP_OFFLINE and tool_name not in bcp_offline.ALLOWED_TOOLS:
++            try:
++                _fn = self._get_thread_state().current_filename
++            except Exception:
++                _fn = ""
++            return bcp_offline.disallowed_tool_message(tool_name, filename=_fn)
++
+         if tool_name not in TOOL_MAP:
+             return f"[Tool Error] Unknown tool: {tool_name}. Available tools: {list(TOOL_MAP.keys())}"
+ 
+@@ -1502,6 +1572,15 @@ IMPORTANT: This state summary is maintained automatically. You can reference it
+             url = tool_args.get("url", "")
+             if not url:
+                 return "[Visit Error] URL cannot be empty."
++            # Resolve bm25://<docid> against the local Lucene index instead of
++            # fetching a live page. Returns full document text (deep reading).
++            if BCP_OFFLINE:
++                try:
++                    _fn = self._get_thread_state().current_filename
++                except Exception:
++                    _fn = ""
++                _tn = getattr(self._get_thread_state(), "current_round", -1)
++                return bcp_offline.visit_bm25(url, tool_args["goal"], filename=_fn, turn_id=_tn)
+ 
+         try:
+             tool_args["params"] = tool_args
