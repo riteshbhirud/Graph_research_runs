@@ -19,26 +19,66 @@ weight completeness is verified against each repo's safetensors index, so an
 interrupted download resumes rather than being silently accepted.
 Use `./setup.sh --no-models` for a code/data-only install (~3 GB).
 
-## Hardware
+## Hardware and GPU allocation
 
 The checkpoints are ~57 GB in bf16, so a GPU with **≥70 GB** holds one alone.
-`run_all.sh` detects VRAM and configures itself:
+`run_all.sh` reads `nvidia-smi` and configures itself:
 
-| GPU | Layout | Notes |
+| GPUs | Layout | Concurrency |
 | --- | --- | --- |
-| H200 141 GB, B200, B300, H100 NVL 94 GB, A100 80 GB | 1 GPU per checkpoint | 3 GPUs runs all three concurrently |
-| A100 40 GB, L40S 48 GB | tensor-parallel 2 | 6 GPUs needed for three concurrent runs |
+| 3+ × H200 141 GB | TP=1, one checkpoint per GPU | all three runs at once |
+| 2 × H200 | TP=1 | SFT + RL first; Base starts automatically when one finishes |
+| 1 × H200 | TP=1 | one at a time, queued automatically |
+| 6 × A100 40 GB | TP=2 | all three runs at once |
+
+Runs are ordered **SFT, RL, Base** because SFT/RL are ~6× more expensive per
+question (62.7 search calls vs 12.6). On a 2-GPU box the two long runs occupy
+both slots and the cheap Base run takes whichever frees first — the shortest
+total wall-clock. Extra GPUs beyond 3 are not used; the job is three runs.
+
+`MAX_WORKERS` scales with VRAM (12 / 16 / 32 / 48) because **throughput is
+KV-cache-bound, not compute-bound**. After 57 GB of weights the remaining VRAM
+becomes KV cache and sets concurrency. Measured on H100 NVL 94 GB: 30 GB KV =
+274,544 tokens = **0.19 questions/min per GPU**. An H200 has ~2.7× that
+headroom, so expect roughly **0.3 q/min**.
 
 Tensor parallelism must divide `num_attention_heads=32` and
 `num_key_value_heads=4` → **TP ∈ {1, 2, 4}**. TP=3 is invalid.
 
-**Throughput is KV-cache-bound, not compute-bound.** After 57 GB of weights,
-whatever VRAM remains becomes KV cache and determines concurrency. Measured on
-H100 NVL 94 GB: 30 GB KV = 274,544 tokens = **0.19 questions/min per GPU**.
-An H200 has ~2.7× that headroom, so expect roughly 0.3 q/min. `run_all.sh`
-scales `MAX_WORKERS` with VRAM for this reason.
+### Expected wall-clock (2,490 questions, all three runs from scratch)
 
-Whole job is ~2,350 remaining questions across three runs.
+| Hardware | Estimate |
+| --- | --- |
+| 3 × H200 | **~45–50 h** (all three concurrent) |
+| 2 × H200 | ~70–75 h |
+| 2 × H100 NVL 94 GB | ~105 h (measured baseline) |
+
+## Interruption and resume
+
+`./run_all.sh` starts a **detached supervisor** that runs until all three rows
+reach 830/830. It survives logout, and re-running it at any time is always the
+correct recovery action — it inspects state and repairs only what is broken.
+
+Every 5 minutes the supervisor:
+
+- **starts** any incomplete run that has a free GPU slot (so queued runs begin
+  the moment one finishes)
+- **restarts** a run whose agent died — resuming from its completed question ids
+- **detects stalled runs**: if an agent is alive but its vLLM server has died,
+  the agent blocks on retries forever and makes no progress. This is a real
+  observed failure mode. The supervisor kills and restarts the pair.
+- **frees a GPU** as soon as a run hits 830/830, so the next run can start
+
+```bash
+./run_all.sh            # start, or recover after any interruption
+./run_all.sh --status   # progress, agent/server health, GPU state
+./run_all.sh --stop     # halt everything cleanly
+```
+
+Only one supervisor can run at a time (pid file), so re-running is harmless.
+Resume is per-run: each completed question is appended to `iter1.jsonl` under a
+write lock the moment it finishes, and the launch banner reports
+`already successfully processed: N`. Nothing is recomputed.
 
 ## What it runs
 

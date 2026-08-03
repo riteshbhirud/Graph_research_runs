@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Serve the three checkpoints and launch the three Table 1 runs.
+# Run the three Table 1 rows to completion, supervising until done.
 #
-# Auto-detects GPU VRAM and picks the layout:
-#   >= 70 GB/GPU (H200, H100 NVL, B200, B300, A100-80) -> 1 GPU per checkpoint
-#   <  70 GB/GPU (A100-40, L40S ...)                   -> tensor-parallel 2
-# A 30B-A3B checkpoint is ~57 GB in bf16, so smaller cards cannot hold one alone.
+#   ./run_all.sh            start + supervise (safe to re-run at any time)
+#   ./run_all.sh --status   progress, then exit
+#   ./run_all.sh --stop     stop all runs and servers cleanly
+#   ./run_all.sh --judge    judge finished runs -> results/table1.md
 #
-#   ./run_all.sh            launch everything (resumes automatically)
-#   ./run_all.sh --status   show progress and exit
-#   ./run_all.sh --judge    judge completed runs and build Table 1
+# Designed for interruption. Re-running after a crash, preemption, reboot or
+# SSH drop is always the correct recovery action: it detects what is complete,
+# what is stalled, and what never started, then repairs only what is broken.
+#
+# GPU allocation: one checkpoint per GPU when VRAM >= 70 GB (a 30B-A3B
+# checkpoint is ~57 GB in bf16), otherwise tensor-parallel 2. Long runs (SFT,
+# RL) are started first so that on a 2-GPU box they occupy both slots and the
+# much cheaper Base run takes whichever frees first.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
@@ -17,35 +22,65 @@ export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
 export HF_HOME="${HF_HOME:-$ROOT/hf_cache}"
 DATA=$ROOT/data/browsecomp_plus/browsecomp_plus_830.jsonl
+TOTAL=830
+SUPLOG=$ROOT/logs/supervisor.log
 mkdir -p logs trajectories checkpoints results
 
-# checkpoint | model dir | output dir | thinking | discard threshold
+# order matters: SFT and RL are ~6x more expensive per question than Base
+#   checkpoint | model dir | output dir | thinking | discard threshold
 RUNS=(
-  "base|models/Qwen3-30B-A3B|quest30b_base_bm25_top5_uncapped|false|30000"
   "sft|models/QUEST-30B-MT-Plus-SFT|quest30b_sft_bm25_top5_uncapped|true|80000"
   "rl|models/QUEST-30B-RL|quest30b_rl_bm25_top5_uncapped|true|80000"
+  "base|models/Qwen3-30B-A3B|quest30b_base_bm25_top5_uncapped|false|30000"
 )
 
-count() { local f; f=$(ls "$1"/deepresearch/*/iter1.jsonl 2>/dev/null | head -1); [[ -n "$f" ]] && wc -l < "$f" || echo 0; }
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$SUPLOG"; }
+count()        { local f; f=$(ls "trajectories/$1"/deepresearch/*/iter1.jsonl 2>/dev/null | head -1); [[ -n "$f" ]] && wc -l < "$f" || echo 0; }
+agent_alive()  { pgrep -f "run_multi_react.py.*$1" >/dev/null; }
+server_alive() { curl -s -m 4 --noproxy '*' "http://localhost:$1/v1/models" 2>/dev/null | grep -q deepresearch; }
+port_for()     { case "$1" in sft) echo 6000;; rl) echo 6002;; base) echo 6004;; esac; }
 
+# ----------------------------------------------------------------- status
 if [[ "${1:-}" == "--status" ]]; then
-    printf '%-42s %s\n' "RUN" "COMPLETED"
-    for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"
-        printf '%-42s %s/830\n' "$od" "$(count "trajectories/$od")"; done
-    echo; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used --format=csv,noheader
+    printf '%-40s %-10s %-9s %s\n' RUN DONE AGENT SERVER
+    for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"; p=$(port_for "$ck")
+        a=$(agent_alive "$od" && echo running || echo "-")
+        s=$(server_alive "$p" && echo "up:$p" || echo "-")
+        printf '%-40s %-10s %-9s %s\n' "$od" "$(count "$od")/$TOTAL" "$a" "$s"
+    done
+    echo; nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader
+    echo; tail -5 "$SUPLOG" 2>/dev/null
     exit 0
 fi
 
+# ------------------------------------------------------------------- stop
+if [[ "${1:-}" == "--stop" ]]; then
+    log "stopping supervisor, agents and servers"
+    [[ -f logs/supervisor.pid ]] && kill "$(cat logs/supervisor.pid)" 2>/dev/null
+    rm -f logs/supervisor.pid
+    for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"
+        for p in $(pgrep -f "run_multi_react.py.*$od"); do kill -9 "$p" 2>/dev/null; done; done
+    for p in $(pgrep -f "vllm.*serve.*served-model-name deepresearch"); do kill "$p" 2>/dev/null; done
+    sleep 5; log "stopped"
+    exit 0
+fi
+
+# ------------------------------------------------------------------ judge
 if [[ "${1:-}" == "--judge" ]]; then
     GPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | head -1)
-    echo "==> serving judge on GPU $GPU"
-    CUDA_VISIBLE_DEVICES=$GPU setsid nohup ./venv/bin/vllm serve models/Qwen3-32B \
-        --served-model-name judge --port 6100 --max-model-len 16384 \
-        --gpu-memory-utilization 0.90 > logs/vllm_judge.log 2>&1 < /dev/null &
-    until curl -s -m 3 --noproxy '*' http://localhost:6100/v1/models 2>/dev/null | grep -q judge; do sleep 15; done
+    VR=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1 | awk '{print int($1/1024)}')
+    JTP=1; (( VR < 70 )) && JTP=2
+    if ! curl -s -m 4 --noproxy '*' http://localhost:6100/v1/models 2>/dev/null | grep -q judge; then
+        log "serving judge (Qwen3-32B, TP=$JTP)"
+        CUDA_VISIBLE_DEVICES=$( [[ $JTP == 2 ]] && echo 0,1 || echo "$GPU" ) \
+        setsid nohup ./venv/bin/vllm serve models/Qwen3-32B --served-model-name judge \
+            --port 6100 --tensor-parallel-size $JTP --max-model-len 16384 \
+            --gpu-memory-utilization 0.90 > logs/vllm_judge.log 2>&1 < /dev/null &
+        until curl -s -m 4 --noproxy '*' http://localhost:6100/v1/models 2>/dev/null | grep -q judge; do sleep 15; done
+    fi
     for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"
-        [[ $(count "trajectories/$od") -gt 0 ]] || continue
-        echo "==> analyzing + judging $od"
+        n=$(count "$od"); [[ $n -gt 0 ]] || continue
+        log "analyzing + judging $od ($n questions)"
         ./venv/bin/python analyze_run.py --run_dir "trajectories/$od" --system QUEST-30B \
             --checkpoint "$ck" --out_dir "results/analyzed_$od" >/dev/null
         ./venv/bin/python judge_run.py --dir "results/analyzed_$od" --base_url http://localhost:6100/v1
@@ -54,63 +89,120 @@ if [[ "${1:-}" == "--judge" ]]; then
     exit 0
 fi
 
-# ------------------------------------------------------------ GPU layout
+# ------------------------------------------------------- hardware layout
 mapfile -t VRAM < <(nvidia-smi --query-gpu=memory.total --format=csv,noheader | awk '{print int($1/1024)}')
-NGPU=${#VRAM[@]}
-PER=${VRAM[0]}
+NGPU=${#VRAM[@]}; PER=${VRAM[0]}
 if (( PER >= 70 )); then TP=1; else TP=2; fi
-NEED=$(( 3 * TP ))
-echo "==> ${NGPU} GPU(s) @ ${PER} GB  ->  tensor-parallel=${TP}, need ${NEED} GPU(s) for 3 concurrent runs"
-if (( NGPU < NEED )); then
-    echo "    only ${NGPU} available: runs will be launched on what fits; re-run this script"
-    echo "    after one finishes to start the rest (all runs resume automatically)."
-fi
+SLOTS=$(( NGPU / TP ))
+if   (( PER >= 170 )); then WORKERS=48
+elif (( PER >= 130 )); then WORKERS=32     # H200 141 GB
+elif (( PER >= 70  )); then WORKERS=16     # H100 NVL / A100 80
+else                        WORKERS=12; fi
+log "hardware: ${NGPU}x ${PER}GB -> TP=$TP, $SLOTS concurrent slot(s), $WORKERS workers/run"
+(( SLOTS < ${#RUNS[@]} )) && log "note: ${#RUNS[@]} runs but $SLOTS slot(s) - remaining runs start automatically as slots free"
 
-start_server() {  # gpus port model maxlen
-    local gpus=$1 port=$2 model=$3 maxlen=$4
-    curl -s -m 3 --noproxy '*' "http://localhost:$port/v1/models" 2>/dev/null | grep -q deepresearch && { echo "    :$port already up"; return 0; }
-    echo "    serving $model on GPU(s) $gpus -> :$port (TP=$TP, max_len=$maxlen)"
+start_server() {  # slot_index port model checkpoint
+    local slot=$1 port=$2 model=$3 ck=$4 maxlen=98304 gpus
+    [[ "$ck" == "base" ]] && maxlen=40960          # Qwen3-30B-A3B native window
+    gpus=$(seq -s, $(( slot * TP )) $(( slot * TP + TP - 1 )))
+    log "  serving $model on GPU(s) $gpus -> :$port (TP=$TP, max_len=$maxlen)"
     CUDA_VISIBLE_DEVICES=$gpus VLLM_ATTENTION_BACKEND=FLASH_ATTN VLLM_USE_FLASHINFER_SAMPLER=0 \
         setsid nohup ./venv/bin/vllm serve "$model" --served-model-name deepresearch \
         --port "$port" --tensor-parallel-size "$TP" --max-model-len "$maxlen" \
         --gpu-memory-utilization 0.92 > "logs/vllm_${port}.log" 2>&1 < /dev/null &
-    until curl -s -m 3 --noproxy '*' "http://localhost:$port/v1/models" 2>/dev/null | grep -q deepresearch; do
-        grep -q "Engine core initialization failed" "logs/vllm_${port}.log" 2>/dev/null && { echo "    FAILED - see logs/vllm_${port}.log"; return 1; }
-        sleep 15
+    local waited=0
+    until server_alive "$port"; do
+        grep -q "Engine core initialization failed\|CUDA out of memory" "logs/vllm_${port}.log" 2>/dev/null && {
+            log "  server :$port FAILED - see logs/vllm_${port}.log"; return 1; }
+        sleep 15; waited=$((waited+15)); (( waited > 1800 )) && { log "  server :$port timed out"; return 1; }
     done
-    grep -o "GPU KV cache size: [0-9,]*" "logs/vllm_${port}.log" | tail -1 | sed 's/^/    /'
+    grep -o "GPU KV cache size: [0-9,]*" "logs/vllm_${port}.log" | tail -1 | sed 's/^/    /' | tee -a "$SUPLOG"
+    return 0
 }
 
-g=0; port=6000
-for r in "${RUNS[@]}"; do
-    IFS='|' read -r CK MODEL OUT THINK THRESH <<< "$r"
-    [[ $(count "trajectories/$OUT") -ge 830 ]] && { echo "==> $OUT already complete"; port=$((port+2)); continue; }
-    (( g + TP > NGPU )) && { echo "==> no GPUs left for $OUT - re-run after one finishes"; break; }
+start_agent() {  # ck model out thinking threshold port
+    local ck=$1 model=$2 out=$3 think=$4 thresh=$5 port=$6
+    local conf=$ROOT/systems/QUEST/inference/endpoints_${ck}.conf
+    printf 'HOSTNAME_LIST=localhost\nPORTS=%s\n' "$port" > "$conf"
+    log "  launching $out from $(count "$out")/$TOTAL ($WORKERS workers)"
+    setsid nohup env DATASET="$DATA" OUTPUT_PATH="$ROOT/trajectories/$out" \
+        BCP_CHECKPOINT="$ck" BM25_TOP_K=5 BCP_VISIT_TOTAL_TOKEN_CAP=0 MAX_WORKERS=$WORKERS \
+        MODEL_PATH="$ROOT/$model" QUEST_ENABLE_THINKING="$think" \
+        MEMORY_CONTEXT_THRESHOLD="$thresh" SERVER_ENDPOINTS_FILE="$conf" \
+        ./run_quest_bm25.sh >> "logs/run_${out}.log" 2>&1 < /dev/null &
+}
 
-    gpus=$(seq -s, $g $((g+TP-1)))
-    # Base (Qwen3-30B-A3B) has a 40,960 native window; SFT/RL are 262,144 natively.
-    if [[ "$CK" == "base" ]]; then MAXLEN=40960; else MAXLEN=98304; fi
-    echo "==> $CK"
-    start_server "$gpus" "$port" "$MODEL" "$MAXLEN" || { g=$((g+TP)); port=$((port+2)); continue; }
+# ------------------------------------------------------------- supervisor
+supervise() {
+    log "supervisor started (pid $$)"
+    echo $$ > logs/supervisor.pid
+    while true; do
+        local busy=0 pending=0
+        # pass 1: reap and repair anything already assigned
+        for r in "${RUNS[@]}"; do
+            IFS='|' read -r CK MODEL OUT THINK THRESH <<< "$r"
+            local port; port=$(port_for "$CK"); local n; n=$(count "$OUT")
 
-    CONF=$ROOT/systems/QUEST/inference/endpoints_${CK}.conf
-    printf 'HOSTNAME_LIST=localhost\nPORTS=%s\n' "$port" > "$CONF"
+            if (( n >= TOTAL )); then
+                if agent_alive "$OUT"; then log "$OUT complete ($n) - stopping agent"; pkill -9 -f "run_multi_react.py.*$OUT"; fi
+                if server_alive "$port"; then log "$OUT complete - freeing :$port"; pkill -f "vllm.*--port $port"; sleep 10; fi
+                continue
+            fi
 
-    # workers scale with KV headroom: KV is the binding constraint
-    if   (( PER >= 170 )); then W=48
-    elif (( PER >= 130 )); then W=32
-    elif (( PER >= 70  )); then W=16
-    else                        W=12; fi
+            if agent_alive "$OUT"; then
+                # STALLED: agent alive but its server is gone (observed failure mode).
+                # The agent blocks on retries and makes no progress - restart both.
+                if ! server_alive "$port"; then
+                    log "$OUT STALLED (agent alive, server :$port dead) - restarting pair"
+                    pkill -9 -f "run_multi_react.py.*$OUT"; sleep 5
+                else
+                    busy=$((busy+1)); continue
+                fi
+            fi
+            pending=$((pending+1))
+        done
 
-    setsid nohup env DATASET="$DATA" OUTPUT_PATH="$ROOT/trajectories/$OUT" \
-        BCP_CHECKPOINT="$CK" BM25_TOP_K=5 BCP_VISIT_TOTAL_TOKEN_CAP=0 MAX_WORKERS=$W \
-        MODEL_PATH="$ROOT/$MODEL" QUEST_ENABLE_THINKING="$THINK" \
-        MEMORY_CONTEXT_THRESHOLD="$THRESH" SERVER_ENDPOINTS_FILE="$CONF" \
-        ./run_quest_bm25.sh >> "logs/run_${OUT}.log" 2>&1 < /dev/null &
-    echo "    launched ($W workers, resumes from $(count "trajectories/$OUT")/830)"
-    g=$((g+TP)); port=$((port+2))
-done
+        # pass 2: fill free slots with pending runs
+        local slot=0
+        for r in "${RUNS[@]}"; do
+            IFS='|' read -r CK MODEL OUT THINK THRESH <<< "$r"
+            local port; port=$(port_for "$CK"); local n; n=$(count "$OUT")
+            (( n >= TOTAL )) && continue
+            agent_alive "$OUT" && { slot=$((slot+1)); continue; }
+            if (( slot >= SLOTS )); then continue; fi
+            log "$OUT needs a slot -> slot $slot"
+            if ! server_alive "$port"; then
+                pkill -f "vllm.*--port $port" 2>/dev/null; sleep 5
+                start_server "$slot" "$port" "$MODEL" "$CK" || { log "  slot $slot unavailable, will retry"; slot=$((slot+1)); continue; }
+            fi
+            start_agent "$CK" "$MODEL" "$OUT" "$THINK" "$THRESH" "$port"
+            sleep 30
+            slot=$((slot+1))
+        done
 
-pgrep -f "disk_watc[h]" >/dev/null || { setsid nohup ./disk_watch.sh >/dev/null 2>&1 < /dev/null & echo "==> disk watchdog started"; }
-echo; echo "==> ./run_all.sh --status   to check progress"
-echo "==> ./run_all.sh --judge    once runs finish"
+        # done?
+        local alldone=1
+        for r in "${RUNS[@]}"; do IFS='|' read -r CK MODEL OUT THINK THRESH <<< "$r"
+            (( $(count "$OUT") >= TOTAL )) || alldone=0; done
+        if (( alldone )); then
+            log "ALL RUNS COMPLETE - run ./run_all.sh --judge"
+            rm -f logs/supervisor.pid
+            return 0
+        fi
+        sleep 300
+    done
+}
+
+# a second supervisor would fight the first over GPUs
+if [[ -f logs/supervisor.pid ]] && kill -0 "$(cat logs/supervisor.pid)" 2>/dev/null; then
+    log "supervisor already running (pid $(cat logs/supervisor.pid)) - nothing to do"
+    log "use --status to watch, --stop to halt"
+    exit 0
+fi
+
+pgrep -f "disk_watc[h]" >/dev/null || { setsid nohup ./disk_watch.sh >/dev/null 2>&1 < /dev/null & log "disk watchdog started"; }
+setsid nohup bash -c "$(declare -f log count agent_alive server_alive port_for start_server start_agent supervise); \
+    ROOT='$ROOT'; DATA='$DATA'; TOTAL=$TOTAL; SUPLOG='$SUPLOG'; TP=$TP; SLOTS=$SLOTS; WORKERS=$WORKERS; \
+    RUNS=($(printf '"%s" ' "${RUNS[@]}")); cd '$ROOT'; supervise" >> "$SUPLOG" 2>&1 < /dev/null &
+sleep 3
+log "supervisor detached - survives logout. ./run_all.sh --status to watch"
