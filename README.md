@@ -129,6 +129,40 @@ Per-trajectory fields include the query-diversity block (exact/near-duplicate
 rates), gold retrieval, `non_tool_turn_fraction`, `termination_type`, and an
 `IMPORTANT_FOR_PAPER` block recording what may be claimed about the numbers.
 
+## Results and getting them back
+
+Results are written **incrementally**, not only at the end:
+
+- the moment a run hits 830/830 the supervisor frees its GPU and immediately
+  runs `analyze_run.py` on it (CPU only), so `results/analyzed_<run>/` exists
+  while the other runs are still going
+- when all three finish, the supervisor automatically judges them, builds
+  `results/table1.md`, and packages the bundle — no manual step
+
+### The bundle to send back
+
+```bash
+./run_all.sh --bundle     # also runs automatically when the job completes
+```
+
+Produces `results_bundle_<date>.tar.gz` containing:
+
+| | |
+| --- | --- |
+| `analyzed_<run>/<qid>.json` | every trajectory in the agreed schema — turns, reasoning, tool calls, observations, all metrics |
+| `analyzed_<run>/_summary.json` | SR, Turns, gold retrieval, duplicate rate, non-tool turn fraction, termination types |
+| `table1.md` | Table 1 + behavioural progression |
+| `event_logs/` | per-tool-call event streams |
+| `oracle_*.json` | BM25 single-query ceiling |
+| `docs/` | what may and may not be claimed vs published numbers |
+| `MANIFEST.md` | host, GPUs, harness commit, completion counts |
+
+**Raw `trajectories/` is deliberately excluded.** Measured: raw QUEST logs run
+~57 MB/question (**~140 GB** for three runs), while the analyzed JSONs hold the
+same trajectories in structured form at ~6.6 MB/question — **~7 GB, roughly
+2 GB compressed**. Everything needed for downstream trajectory analysis is in
+the bundle; ask for the raw logs only if byte-level reproduction is required.
+
 ## Metric definitions
 
 - **SR** = judged-correct / 830 × 100, using the **official BrowseComp-Plus

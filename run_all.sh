@@ -65,6 +65,53 @@ if [[ "${1:-}" == "--stop" ]]; then
     exit 0
 fi
 
+# ----------------------------------------------------------------- bundle
+# Package everything needed for the paper into one archive. Deliberately
+# excludes trajectories/ (raw QUEST logs, ~140 GB): results/analyzed_*/ already
+# contains every trajectory in the agreed schema - turns, reasoning, tool calls,
+# observations and all metrics - at ~3 MB/question instead of ~57 MB.
+if [[ "${1:-}" == "--bundle" ]]; then
+    STAMP=$(date +%Y%m%d)
+    OUTDIR="results_bundle_${STAMP}"
+    rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+    cp -r results/analyzed_* "$OUTDIR"/ 2>/dev/null
+    cp results/table1.md "$OUTDIR"/ 2>/dev/null
+    cp results/oracle_bm25_ceiling.json results/oracle_k_sweep.json "$OUTDIR"/ 2>/dev/null
+    mkdir -p "$OUTDIR/event_logs"
+    for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"
+        for f in events.jsonl multi_block_events.jsonl visit_cap_events_*.jsonl; do
+            [[ -f "trajectories/$od/$f" ]] && cp "trajectories/$od/$f" "$OUTDIR/event_logs/${od}__${f}" 2>/dev/null
+        done; done
+    cp -r docs "$OUTDIR"/ 2>/dev/null
+    {
+        echo "# Results bundle — QUEST-30B on BrowseComp-Plus (BM25 top-5, 830q)"
+        echo
+        echo "Generated: $(date -u '+%F %T UTC')"
+        echo "Host: $(hostname)   GPUs: $(nvidia-smi --query-gpu=name --format=csv,noheader | sort -u | tr '\n' ' ')"
+        echo "Harness commit: $(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
+        echo
+        echo "## Completion"
+        for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"
+            echo "- $od: $(count "$od")/$TOTAL"; done
+        echo
+        echo "## Contents"
+        echo "- analyzed_<run>/<qid>.json  full trajectory per question, agreed schema"
+        echo "- analyzed_<run>/_summary.json  SR, Turns, all behavioural metrics"
+        echo "- table1.md                  Table 1 + behavioural progression"
+        echo "- event_logs/                per-tool-call event streams"
+        echo "- oracle_*.json              BM25 single-query ceiling"
+        echo "- docs/                      what may/may not be claimed vs published numbers"
+        echo
+        echo "NOT included: trajectories/ (raw QUEST logs, ~140 GB). The analyzed"
+        echo "JSONs contain the same trajectories in structured form. Ask for the raw"
+        echo "logs only if byte-level reproduction is needed."
+    } > "$OUTDIR/MANIFEST.md"
+    tar czf "${OUTDIR}.tar.gz" "$OUTDIR"
+    echo "bundle: ${OUTDIR}.tar.gz  ($(du -sh "${OUTDIR}.tar.gz" | cut -f1))"
+    echo "share it, or: rsync -avP ${OUTDIR}.tar.gz <dest>"
+    exit 0
+fi
+
 # ------------------------------------------------------------------ judge
 if [[ "${1:-}" == "--judge" ]]; then
     GPU=$(nvidia-smi --query-gpu=index --format=csv,noheader | head -1)
@@ -146,6 +193,15 @@ supervise() {
             if (( n >= TOTAL )); then
                 if agent_alive "$OUT"; then log "$OUT complete ($n) - stopping agent"; pkill -9 -f "run_multi_react.py.*$OUT"; fi
                 if server_alive "$port"; then log "$OUT complete - freeing :$port"; pkill -f "vllm.*--port $port"; sleep 10; fi
+                # analyse immediately (CPU only) so structured results exist as
+                # soon as a run finishes, without waiting for the whole job
+                if [[ ! -f "results/analyzed_$OUT/_summary.json" ]]; then
+                    log "$OUT complete - analysing (no GPU needed)"
+                    ./venv/bin/python analyze_run.py --run_dir "trajectories/$OUT" \
+                        --system QUEST-30B --checkpoint "$CK" \
+                        --out_dir "results/analyzed_$OUT" >> "$SUPLOG" 2>&1 \
+                        && log "$OUT analysed -> results/analyzed_$OUT"
+                fi
                 continue
             fi
 
@@ -185,7 +241,9 @@ supervise() {
         for r in "${RUNS[@]}"; do IFS='|' read -r CK MODEL OUT THINK THRESH <<< "$r"
             (( $(count "$OUT") >= TOTAL )) || alldone=0; done
         if (( alldone )); then
-            log "ALL RUNS COMPLETE - run ./run_all.sh --judge"
+            log "ALL RUNS COMPLETE - judging automatically"
+            "$ROOT/run_all.sh" --judge >> "$SUPLOG" 2>&1 && log "judging done"
+            "$ROOT/run_all.sh" --bundle >> "$SUPLOG" 2>&1 && log "results bundle ready"
             rm -f logs/supervisor.pid
             return 0
         fi
