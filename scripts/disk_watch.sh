@@ -9,7 +9,7 @@
 # Model weights are deleted manually at run transitions, because a live vLLM
 # server holds them mmap'd.
 set -u
-ROOT=/home/x5o/ChenWork
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 LOG=$ROOT/logs/disk_watch.log
 WARN_GB=80
 CRIT_GB=50

@@ -10,7 +10,8 @@
 #   R2  YaRN rope-scaling to 131072; MEMORY_CONTEXT_THRESHOLD = 80000
 set -euo pipefail
 
-REPO_ROOT="/home/x5o/ChenWork"
+# Derived from this script's own location so the harness is portable.
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 INFERENCE_DIR="${REPO_ROOT}/systems/QUEST/inference"
 
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
