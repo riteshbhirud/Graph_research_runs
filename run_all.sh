@@ -34,9 +34,10 @@ RUNS=(
   "base|models/Qwen3-30B-A3B|quest30b_base_bm25_top5_uncapped|false|30000"
 )
 
-log() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$SUPLOG"; }
+log() { local m; m="$(date '+%F %T') $*"; echo "$m";
+        [[ "${IN_SUPERVISOR:-0}" == 1 ]] || echo "$m" >> "$SUPLOG"; }
 count()        { local f; f=$(ls "trajectories/$1"/deepresearch/*/iter1.jsonl 2>/dev/null | head -1); [[ -n "$f" ]] && wc -l < "$f" || echo 0; }
-agent_alive()  { pgrep -f "run_multi_react.py.*$1" >/dev/null; }
+agent_alive()  { pgrep -f "run_multi_react.py.*$ROOT/trajectories/$1" >/dev/null; }
 server_alive() { curl -s -m 4 --noproxy '*' "http://localhost:$1/v1/models" 2>/dev/null | grep -q deepresearch; }
 port_for()     { case "$1" in sft) echo 6000;; rl) echo 6002;; base) echo 6004;; esac; }
 
@@ -59,7 +60,7 @@ if [[ "${1:-}" == "--stop" ]]; then
     [[ -f logs/supervisor.pid ]] && kill "$(cat logs/supervisor.pid)" 2>/dev/null
     rm -f logs/supervisor.pid
     for r in "${RUNS[@]}"; do IFS='|' read -r ck md od th mt <<< "$r"
-        for p in $(pgrep -f "run_multi_react.py.*$od"); do kill -9 "$p" 2>/dev/null; done; done
+        for p in $(pgrep -f "run_multi_react.py.*$ROOT/trajectories/$od"); do kill -9 "$p" 2>/dev/null; done; done
     for p in $(pgrep -f "vllm.*serve.*served-model-name deepresearch"); do kill "$p" 2>/dev/null; done
     sleep 5; log "stopped"
     exit 0
@@ -163,7 +164,7 @@ start_server() {  # slot_index port model checkpoint
             log "  server :$port FAILED - see logs/vllm_${port}.log"; return 1; }
         sleep 15; waited=$((waited+15)); (( waited > 1800 )) && { log "  server :$port timed out"; return 1; }
     done
-    grep -o "GPU KV cache size: [0-9,]*" "logs/vllm_${port}.log" | tail -1 | sed 's/^/    /' | tee -a "$SUPLOG"
+    grep -o "GPU KV cache size: [0-9,]*" "logs/vllm_${port}.log" | tail -1 | sed 's/^/    /'
     return 0
 }
 
@@ -191,7 +192,7 @@ supervise() {
             local port; port=$(port_for "$CK"); local n; n=$(count "$OUT")
 
             if (( n >= TOTAL )); then
-                if agent_alive "$OUT"; then log "$OUT complete ($n) - stopping agent"; pkill -9 -f "run_multi_react.py.*$OUT"; fi
+                if agent_alive "$OUT"; then log "$OUT complete ($n) - stopping agent"; pkill -9 -f "run_multi_react.py.*$ROOT/trajectories/$OUT"; fi
                 if server_alive "$port"; then log "$OUT complete - freeing :$port"; pkill -f "vllm.*--port $port"; sleep 10; fi
                 # analyse immediately (CPU only) so structured results exist as
                 # soon as a run finishes, without waiting for the whole job
@@ -210,7 +211,7 @@ supervise() {
                 # The agent blocks on retries and makes no progress - restart both.
                 if ! server_alive "$port"; then
                     log "$OUT STALLED (agent alive, server :$port dead) - restarting pair"
-                    pkill -9 -f "run_multi_react.py.*$OUT"; sleep 5
+                    pkill -9 -f "run_multi_react.py.*$ROOT/trajectories/$OUT"; sleep 5
                 else
                     busy=$((busy+1)); continue
                 fi
@@ -251,6 +252,12 @@ supervise() {
     done
 }
 
+if [[ "${1:-}" == "--supervise-loop" ]]; then
+    export IN_SUPERVISOR=1
+    supervise
+    exit 0
+fi
+
 # a second supervisor would fight the first over GPUs
 if [[ -f logs/supervisor.pid ]] && kill -0 "$(cat logs/supervisor.pid)" 2>/dev/null; then
     log "supervisor already running (pid $(cat logs/supervisor.pid)) - nothing to do"
@@ -259,8 +266,6 @@ if [[ -f logs/supervisor.pid ]] && kill -0 "$(cat logs/supervisor.pid)" 2>/dev/n
 fi
 
 pgrep -f "disk_watc[h]" >/dev/null || { setsid nohup ./disk_watch.sh >/dev/null 2>&1 < /dev/null & log "disk watchdog started"; }
-setsid nohup bash -c "$(declare -f log count agent_alive server_alive port_for start_server start_agent supervise); \
-    ROOT='$ROOT'; DATA='$DATA'; TOTAL=$TOTAL; SUPLOG='$SUPLOG'; TP=$TP; SLOTS=$SLOTS; WORKERS=$WORKERS; \
-    RUNS=($(printf '"%s" ' "${RUNS[@]}")); cd '$ROOT'; supervise" >> "$SUPLOG" 2>&1 < /dev/null &
+IN_SUPERVISOR=1 setsid nohup "$ROOT/run_all.sh" --supervise-loop >> "$SUPLOG" 2>&1 < /dev/null &
 sleep 3
 log "supervisor detached - survives logout. ./run_all.sh --status to watch"
