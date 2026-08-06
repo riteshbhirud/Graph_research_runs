@@ -130,7 +130,7 @@ def main():
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--tokenizer", default="models/Qwen3-30B-A3B")
-    ap.add_argument("--max_turns", type=int, default=100,
+    ap.add_argument("--max_turns", type=int, default=60,
                     help="turn cap; used to classify termination_type")
     ap.add_argument("--denominator", type=int, default=830,
                     help="Table 1 denominator (full dataset size), not just completed count")
